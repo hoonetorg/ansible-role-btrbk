@@ -1,0 +1,16 @@
+#jinja2: lstrip_blocks: True
+# {{ ansible_managed }}
+[Unit]
+Description={{ item.description | default('btrbk ' ~ item.command) }}
+Documentation=man:btrbk(1)
+{% if item.requires_mounts_for | default([]) | length > 0 %}
+RequiresMountsFor={{ item.requires_mounts_for | join(' ') }}
+{% endif %}
+{% for unit in item.requires | default([]) %}
+Requires={{ unit }}
+After={{ unit }}
+{% endfor %}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/btrbk -c {{ item.conf_path | default(btrbk_final.conf_path) }} {{ (item.options | default([]) + [item.command] + item.filters | default([])) | map('quote') | join(' ') }}

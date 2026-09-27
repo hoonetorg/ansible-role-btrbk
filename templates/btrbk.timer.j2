@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Timer for {{ item.description | default('btrbk ' ~ item.command) }}
+
+[Timer]
+OnCalendar={{ item.timer.on_calendar | default('hourly') }}
+AccuracySec={{ item.timer.accuracy_sec | default('1m') }}
+Persistent={{ 'true' if item.timer.persistent | default(true) else 'false' }}
+
+[Install]
+WantedBy=timers.target

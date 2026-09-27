@@ -1,0 +1,33 @@
+---
+# Merged (recursively) with the inventory variable `btrbk` into `btrbk_final`.
+# Only set in `btrbk:` what differs from these defaults.
+btrbk_defaults:
+  package: btrbk
+  conf_path: /etc/btrbk/btrbk.conf
+
+  # mask the btrbk.timer shipped by the distribution package (runs `btrbk run`)
+  mask_shipped_timer: true
+
+  # global btrbk.conf options (key: value, list values produce repeated lines,
+  # booleans are rendered as yes/no)
+  config:
+    transaction_log: /var/log/btrbk.log
+    lockfile: /run/btrbk.lock
+    timestamp_format: long-iso
+    snapshot_dir: .snapshots
+    snapshot_create: always
+    incremental: true
+    snapshot_preserve_min: latest
+    snapshot_preserve: 36h 14d 8w 24m 2y
+    target_preserve_min: all
+    target_preserve: "no"
+
+  # volume sections, see README.md
+  volumes: []
+
+  # systemd units btrbk-<name>.service (+ .timer if `timer` is set), see README.md
+  units: []
+
+  # btrbk-force-prune-<group>.service (+ /etc/btrbk/btrbk-force-prune-<group>.conf) for every target group,
+  # started manually only: prunes snapshots of that group's subvolumes although the disk is not connected
+  force_prune_units: true

@@ -1,0 +1,44 @@
+#jinja2: lstrip_blocks: True
+# {{ ansible_managed }}
+{% if btrbk_exclude_group | default('') %}
+# force-prune config for btrbk-force-prune-{{ btrbk_exclude_group }}.service only:
+# targets of group "{{ btrbk_exclude_group }}" are removed, so their subvolumes are pruned by retention
+{% endif %}
+{% macro options(opts, indent) %}
+{% for key, value in (opts | default({})).items() %}
+{% for v in (value if (value is iterable and value is not string and value is not mapping) else [value]) %}
+{{ indent }}{{ key }}  {{ ('yes' if v else 'no') if v is boolean else v }}
+{% endfor %}
+{% endfor %}
+{% endmacro %}
+{# exclude: skip dict targets whose group(s) contain it (force-prune configs) #}
+{% macro targets(tlist, indent, exclude='') %}
+{% for t in (tlist | default([])) %}
+{% set tgroups = (t.options | default({})).group | default([]) if t is mapping else [] %}
+{% if exclude and exclude in ([tgroups] if tgroups is string else tgroups) %}
+{% elif t is string %}
+{{ indent }}target  {{ t }}
+{% else %}
+{{ indent }}target  {{ t.type ~ ' ' if t.type is defined else '' }}{{ t.path }}
+{{ options(t.options, indent ~ '  ') }}
+{%- endif %}
+{% endfor %}
+{% endmacro %}
+
+{{ options(btrbk_final.config, '') }}
+{%- for volume in btrbk_final.volumes %}
+
+volume {{ volume.path }}
+{{ options(volume.options, '  ') }}
+{{- targets(volume.targets, '  ', btrbk_exclude_group | default('')) }}
+{%- for subvolume in volume.subvolumes | default([]) %}
+
+  subvolume {{ subvolume.name }}
+{# nested subvolume: btrbk defaults to the basename, use the full path with / -> _ to keep names unique #}
+{% if '/' in subvolume.name | trim('/') and 'snapshot_name' not in (subvolume.options | default({})) %}
+    snapshot_name  {{ subvolume.name | trim('/') | replace('/', '_') }}
+{% endif %}
+{{ options(subvolume.options, '    ') }}
+{{- targets(subvolume.targets, '    ', btrbk_exclude_group | default('')) }}
+{%- endfor %}
+{% endfor %}

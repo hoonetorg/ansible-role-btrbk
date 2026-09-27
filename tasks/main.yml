@@ -1,0 +1,202 @@
+---
+- name: Build final btrbk configuration
+  ansible.builtin.set_fact:
+    btrbk_final: "{{ btrbk_defaults | combine(btrbk | default({}), recursive=True) }}"
+    btrbk_required_paths: []
+
+- name: Install btrbk
+  ansible.builtin.package:
+    name: "{{ btrbk_final.package }}"
+    state: present
+
+# snapshot_dir: subvolume option > volume option > global option; relative to the volume unless absolute
+- name: Collect volume paths and snapshot dirs that must exist
+  ansible.builtin.set_fact:
+    btrbk_required_paths: "{{ btrbk_required_paths + [item.0.path, snapdir if snapdir.startswith('/') else item.0.path ~ '/' ~ snapdir] }}"
+  vars:
+    snapdir: "{{ (item.1.options | default({})).snapshot_dir | default((item.0.options | default({})).snapshot_dir | default(btrbk_final.config.snapshot_dir)) }}"
+  loop: "{{ query('subelements', btrbk_final.volumes, 'subvolumes', {'skip_missing': True}) }}"
+
+- name: Check volume paths and snapshot dirs
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ btrbk_required_paths | unique }}"
+  register: btrbk_path_stat
+
+- name: Assert volume paths and snapshot dirs exist
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isdir
+    fail_msg: "{{ item.item }} must exist (create it e.g. as btrfs subvolume via the disk role)"
+    quiet: true
+  loop: "{{ btrbk_path_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Write btrbk.conf
+  ansible.builtin.template:
+    src: btrbk.conf.j2
+    dest: "{{ btrbk_final.conf_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    # -n: do not take the lockfile (would fail while a backup is running)
+    validate: "btrbk -n -c %s config print"
+
+- name: Mask shipped btrbk.timer
+  ansible.builtin.systemd_service:
+    name: btrbk.timer
+    state: stopped
+    enabled: false
+    masked: true
+  when: btrbk_final.mask_shipped_timer
+  # unit is unknown in check mode when the package is not installed yet
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Write btrbk service units
+  ansible.builtin.template:
+    src: btrbk.service.j2
+    dest: "/etc/systemd/system/btrbk-{{ item.name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ btrbk_final.units }}"
+  loop_control:
+    label: "btrbk-{{ item.name }}.service"
+  when: item.state | default('present') == 'present'
+  notify: btrbk daemon-reload
+
+- name: Write btrbk timer units
+  ansible.builtin.template:
+    src: btrbk.timer.j2
+    dest: "/etc/systemd/system/btrbk-{{ item.name }}.timer"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ btrbk_final.units }}"
+  loop_control:
+    label: "btrbk-{{ item.name }}.timer"
+  when:
+    - item.state | default('present') == 'present'
+    - item.timer is defined
+  register: btrbk_timer_files
+  notify: btrbk daemon-reload
+
+# force-prune: per target group a config without that group's targets and a manually started unit
+# running "btrbk prune" on it (see README.md)
+- name: Collect btrbk target groups
+  ansible.builtin.set_fact:
+    btrbk_target_groups: >-
+      {{ ((btrbk_final.volumes | map(attribute='targets', default=[]) | flatten)
+          + (btrbk_final.volumes | map(attribute='subvolumes', default=[]) | flatten
+             | map(attribute='targets', default=[]) | flatten))
+         | select('mapping') | map(attribute='options', default={})
+         | map(attribute='group', default=[]) | flatten | unique | list
+         if btrbk_final.force_prune_units else [] }}
+    btrbk_force_prune_units: []
+
+- name: Build force-prune unit definitions
+  ansible.builtin.set_fact:
+    btrbk_force_prune_units: >-
+      {{ btrbk_force_prune_units + [{
+           'name': 'force-prune-' ~ item,
+           'description': 'btrbk FORCE prune snapshots of targets in group ' ~ item
+                          ~ ' (next backup to ' ~ item ~ ' may use an older common parent)',
+           'command': 'prune',
+           'options': ['-v'],
+           'conf_path': '/etc/btrbk/btrbk-force-prune-' ~ item ~ '.conf'}] }}
+  loop: "{{ btrbk_target_groups }}"
+
+- name: Write force-prune configs
+  ansible.builtin.template:
+    src: btrbk.conf.j2
+    dest: "{{ item.conf_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "btrbk -n -c %s config print"
+  vars:
+    btrbk_exclude_group: "{{ item.name | regex_replace('^force-prune-', '') }}"
+  loop: "{{ btrbk_force_prune_units }}"
+  loop_control:
+    label: "{{ item.conf_path }}"
+
+# no timer, no [Install]: only runs with "systemctl start btrbk-force-prune-<group>"
+- name: Write force-prune service units
+  ansible.builtin.template:
+    src: btrbk.service.j2
+    dest: "/etc/systemd/system/btrbk-{{ item.name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ btrbk_force_prune_units }}"
+  loop_control:
+    label: "btrbk-{{ item.name }}.service"
+  notify: btrbk daemon-reload
+
+- name: Find force-prune units and configs
+  ansible.builtin.find:
+    paths: [/etc/systemd/system, /etc/btrbk]
+    patterns: ["btrbk-force-prune-*.service", "btrbk-force-prune-*.conf"]
+  register: btrbk_force_prune_files
+
+- name: Remove force-prune units and configs of groups that no longer exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ btrbk_force_prune_files.files | map(attribute='path')
+       | reject('in', btrbk_force_prune_units | map(attribute='conf_path') | list)
+       | reject('in', btrbk_force_prune_units | map(attribute='name')
+                      | map('regex_replace', '^', '/etc/systemd/system/btrbk-')
+                      | map('regex_replace', '$', '.service') | list)
+       | list }}
+  notify: btrbk daemon-reload
+
+- name: Stop and disable absent btrbk units
+  ansible.builtin.command:
+    cmd: "systemctl disable --now btrbk-{{ item.0.name }}.{{ item.1 }}"
+    removes: "/etc/systemd/system/btrbk-{{ item.0.name }}.{{ item.1 }}"
+  loop: "{{ btrbk_final.units | product(['timer', 'service']) | list }}"
+  loop_control:
+    label: "btrbk-{{ item.0.name }}.{{ item.1 }}"
+  when: item.0.state | default('present') == 'absent'
+
+- name: Remove absent btrbk units
+  ansible.builtin.file:
+    path: "/etc/systemd/system/btrbk-{{ item.0.name }}.{{ item.1 }}"
+    state: absent
+  loop: "{{ btrbk_final.units | product(['timer', 'service']) | list }}"
+  loop_control:
+    label: "btrbk-{{ item.0.name }}.{{ item.1 }}"
+  when: item.0.state | default('present') == 'absent'
+  notify: btrbk daemon-reload
+
+- name: Flush handlers (daemon-reload)
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start btrbk timers
+  ansible.builtin.systemd_service:
+    name: "btrbk-{{ item.name }}.timer"
+    enabled: "{{ item.timer.enabled | default(true) }}"
+    state: "{{ 'started' if item.timer.enabled | default(true) else 'stopped' }}"
+  loop: "{{ btrbk_final.units }}"
+  loop_control:
+    label: "btrbk-{{ item.name }}.timer"
+  when:
+    - item.state | default('present') == 'present'
+    - item.timer is defined
+  # unit file is not written in check mode
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Restart changed btrbk timers
+  ansible.builtin.systemd_service:
+    name: "btrbk-{{ item.item.name }}.timer"
+    state: restarted
+  loop: "{{ btrbk_timer_files.results | selectattr('changed', 'defined') | selectattr('changed') | list }}"
+  loop_control:
+    label: "btrbk-{{ item.item.name }}.timer"
+  when:
+    - not ansible_check_mode
+    - item.item.timer.enabled | default(true)
