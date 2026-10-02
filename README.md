@@ -71,11 +71,11 @@ volumes:
     subvolumes:
       - name: home
         targets:
-          - path: "/mnt/backup-a/{{ inventory_hostname }}"
+          - path: "/mnt/backup-a/{{ inventory_hostname_short }}"
             options: { noauto: true, group: disk-a }
       - name: data
         targets:
-          - path: "/mnt/backup-b/{{ inventory_hostname }}"
+          - path: "/mnt/backup-b/{{ inventory_hostname_short }}"
             options: { noauto: true, group: disk-b }
 units:
   - { name: backup-disk-a, command: resume, options: ["-v"], filters: [disk-a], requires_mounts_for: [/mnt/backup-a] }
